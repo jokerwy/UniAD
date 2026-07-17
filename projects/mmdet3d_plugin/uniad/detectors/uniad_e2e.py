@@ -12,7 +12,7 @@ import os
 from ..dense_heads.seg_head_plugin import IOU
 from .uniad_track import UniADTrack
 from mmdet.models.builder import build_head
-
+from ..dense_heads.seg_head_plugin.seg_detr_head import SegDETRHead
 @DETECTORS.register_module()
 class UniAD(UniADTrack):
     """
@@ -46,7 +46,11 @@ class UniAD(UniADTrack):
         self.task_loss_weight = task_loss_weight
         assert set(task_loss_weight.keys()) == \
                {'track', 'occ', 'motion', 'map', 'planning'}
-
+        self.seg_head: SegDETRHead = build_head(seg_head)
+        self.occ_head: SegDETRHead = build_head(occ_head)
+        self.motion_head: SegDETRHead = build_head(motion_head)
+        self.planning_head: SegDETRHead = build_head(planning_head)
+        
     @property
     def with_planning_head(self):
         return hasattr(self, 'planning_head') and self.planning_head is not None
