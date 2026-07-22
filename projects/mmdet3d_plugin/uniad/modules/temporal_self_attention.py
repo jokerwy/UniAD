@@ -4,6 +4,36 @@
 #  Modified by Zhiqi Li
 # ---------------------------------------------
 
+"""
+时序自注意力 (Temporal Self-Attention, TSA)
+============================================
+负责将当前帧 BEV queries 与上一帧 BEV 特征进行交互，实现时序信息融合。
+
+核心思想:
+    当前帧的 BEV query 通过可变形注意力，在上一帧 BEV 特征图上的对应位置采样。
+    由于自车在两帧之间发生了运动，需要对上一帧的 BEV 参考点施加位移补偿。
+
+TSA 与 SCA 的对比:
+    TSA (时序): query=当前BEV, key/value=上一帧BEV, 在BEV平面上采样
+    SCA (空间): query=BEV点,   key/value=图像特征, 投影到图像上采样
+
+时序融合机制:
+    1. 将上一帧 BEV 和当前帧 BEV query 拼接 (bs*2, len_bev, C)
+    2. 对上一帧 BEV 的参考点施加 shift 偏移 (自车运动补偿)
+    3. 当前帧 BEV query 可以关注上一帧 BEV 中的相关空间位置
+    4. 融合历史信息和当前帧信息: 对两个 BEV 的输出取平均
+
+Args:
+    embed_dims: 特征嵌入维度，默认 256
+    num_heads: 注意力头数，默认 8
+    num_levels: 多尺度特征层数，TSA 中通常为 1 (只有 BEV 特征)
+    num_points: 每个 query 在每个 head 的采样点数，默认 4
+    num_bev_queue: BEV 队列长度，默认为 2 (当前帧 + 上一帧)
+    im2col_step: CUDA 实现的并行参数
+    dropout: Dropout 概率
+    batch_first: 是否 batch 维度在第一维
+"""
+
 from .multi_scale_deformable_attn_function import MultiScaleDeformableAttnFunction_fp32
 from mmcv.ops.multi_scale_deform_attn import multi_scale_deformable_attn_pytorch
 import warnings
@@ -23,32 +53,31 @@ ext_module = ext_loader.load_ext(
 
 @ATTENTION.register_module()
 class TemporalSelfAttention(BaseModule):
-    """An attention module used in BEVFormer based on Deformable-Detr.
+    """时序自注意力 (TSA)
 
-    `Deformable DETR: Deformable Transformers for End-to-End Object Detection.
-    <https://arxiv.org/pdf/2010.04159.pdf>`_.
+    基于可变形注意力实现，当前帧 BEV query 在上一帧 BEV 特征上采样。
+    通过自车运动补偿，对齐两帧之间的空间位置关系。
+
+    关键设计:
+    1. num_bev_queue=2: 同时处理当前帧和上一帧 BEV
+    2. query 由当前帧 query 和上一帧 value 拼接而成
+       这样 query 同时包含两帧的信息，可以更好地决定关注哪些位置
+    3. 融合方式: 对两帧的输出取平均 (mean)
+
+    与普通可变形注意力的区别:
+    - 普通: query 预测采样偏移量，在 value 上采样
+    - TSA: query 由 [prev_value, current_query] 拼接而成
+           采样偏移量按 num_bev_queue 分组，分别对应两帧
 
     Args:
-        embed_dims (int): The embedding dimension of Attention.
-            Default: 256.
-        num_heads (int): Parallel attention heads. Default: 64.
-        num_levels (int): The number of feature map used in
-            Attention. Default: 4.
-        num_points (int): The number of sampling points for
-            each query in each head. Default: 4.
-        im2col_step (int): The step used in image_to_column.
-            Default: 64.
-        dropout (float): A Dropout layer on `inp_identity`.
-            Default: 0.1.
-        batch_first (bool): Key, Query and Value are shape of
-            (batch, n, embed_dim)
-            or (n, batch, embed_dim). Default to True.
-        norm_cfg (dict): Config dict for normalization layer.
-            Default: None.
-        init_cfg (obj:`mmcv.ConfigDict`): The Config for initialization.
-            Default: None.
-        num_bev_queue (int): In this version, we only use one history BEV and one currenct BEV.
-         the length of BEV queue is 2.
+        embed_dims: 特征嵌入维度，默认 256
+        num_heads: 注意力头数，默认 8
+        num_levels: 特征层级数，TSA 中为 1 (只有 BEV 特征)
+        num_points: 每个 head 的采样点数，默认 4
+        num_bev_queue: BEV 队列长度，默认 2 (当前帧 + 上一帧)
+        im2col_step: 图像到列步长
+        dropout: Dropout 概率
+        batch_first: 是否 batch 维度在第一维
     """
 
     def __init__(self,
@@ -73,8 +102,6 @@ class TemporalSelfAttention(BaseModule):
         self.batch_first = batch_first
         self.fp16_enabled = False
 
-        # you'd better set dim_per_head to a power of 2
-        # which is more efficient in the CUDA implementation
         def _is_power_of_2(n):
             if (not isinstance(n, int)) or (n < 0):
                 raise ValueError(
@@ -94,17 +121,31 @@ class TemporalSelfAttention(BaseModule):
         self.num_levels = num_levels
         self.num_heads = num_heads
         self.num_points = num_points
-        self.num_bev_queue = num_bev_queue
+        self.num_bev_queue = num_bev_queue  # BEV 队列长度 (当前帧 + 历史帧)
+
+        # sampling_offsets: 输入是 [prev_value, query] 的拼接 (2*C)
+        # 输出按 num_bev_queue 分组，分别对应两帧的采样偏移量
         self.sampling_offsets = nn.Linear(
-            embed_dims*self.num_bev_queue, num_bev_queue*num_heads * num_levels * num_points * 2)
+            embed_dims*self.num_bev_queue,
+            num_bev_queue*num_heads * num_levels * num_points * 2)
+
+        # attention_weights: 类似地按 num_bev_queue 分组
         self.attention_weights = nn.Linear(embed_dims*self.num_bev_queue,
                                            num_bev_queue*num_heads * num_levels * num_points)
+
+        # value 投影和输出投影
         self.value_proj = nn.Linear(embed_dims, embed_dims)
         self.output_proj = nn.Linear(embed_dims, embed_dims)
         self.init_weights()
 
     def init_weights(self):
-        """Default initialization for Parameters of Module."""
+        """初始化权重
+
+        - sampling_offsets: bias 初始化为放射状分布
+           考虑 num_bev_queue 维度，每个 queue 有不同的初始化
+        - attention_weights: 初始化为 0
+        - value_proj 和 output_proj: Xavier 均匀初始化
+        """
         constant_init(self.sampling_offsets, 0.)
         thetas = torch.arange(
             self.num_heads,
@@ -135,44 +176,33 @@ class TemporalSelfAttention(BaseModule):
                 spatial_shapes=None,
                 level_start_index=None,
                 flag='decoder',
-
                 **kwargs):
-        """Forward Function of MultiScaleDeformAttention.
+        """时序自注意力前向传播
+
+        核心流程:
+        1. 构建 value: 将 prev_bev 和当前 query 拼接
+        2. 构建 query: 将 prev_value 和当前 query 拼接
+        3. 预测采样偏移量 (按 num_bev_queue 分组)
+        4. 在 BEV 特征上执行可变形注意力
+        5. 融合两帧的输出 (取平均)
 
         Args:
-            query (Tensor): Query of Transformer with shape
-                (num_query, bs, embed_dims).
-            key (Tensor): The key tensor with shape
-                `(num_key, bs, embed_dims)`.
-            value (Tensor): The value tensor with shape
-                `(num_key, bs, embed_dims)`.
-            identity (Tensor): The tensor used for addition, with the
-                same shape as `query`. Default None. If None,
-                `query` will be used.
-            query_pos (Tensor): The positional encoding for `query`.
-                Default: None.
-            key_pos (Tensor): The positional encoding for `key`. Default
-                None.
-            reference_points (Tensor):  The normalized reference
-                points with shape (bs, num_query, num_levels, 2),
-                all elements is range in [0, 1], top-left (0,0),
-                bottom-right (1, 1), including padding area.
-                or (N, Length_{query}, num_levels, 4), add
-                additional two dimensions is (w, h) to
-                form reference boxes.
-            key_padding_mask (Tensor): ByteTensor for `query`, with
-                shape [bs, num_key].
-            spatial_shapes (Tensor): Spatial shape of features in
-                different levels. With shape (num_levels, 2),
-                last dimension represents (h, w).
-            level_start_index (Tensor): The start index of each level.
-                A tensor has shape ``(num_levels, )`` and can be represented
-                as [0, h_0*w_0, h_0*w_0+h_1*w_1, ...].
+            query: 当前帧 BEV 查询 (bs, num_query, C)
+            key/value: 上一帧 BEV 特征 (bs*2, num_query, C) 或 None
+                如果为 None，内部自动构建
+            identity: 残差连接的输入
+            query_pos: 查询位置编码 (bev_pos)
+            reference_points: 2D 参考点 (bs*2, num_query, num_levels, 2)
+                前半部分为上一帧参考点 (带 shift 偏移)
+                后半部分为当前帧参考点
+            spatial_shapes: BEV 特征图空间形状 [[bev_h, bev_w]]
+            level_start_index: 特征起始索引 [0]
 
         Returns:
-             Tensor: forwarded results with shape [num_query, bs, embed_dims].
+            output: 融合后的 BEV 特征 (bs, num_query, C)
         """
 
+        # 如果没有提供 value，自动构建: 将 query 复制两份
         if value is None:
             assert self.batch_first
             bs, len_bev, c = query.shape
@@ -183,28 +213,39 @@ class TemporalSelfAttention(BaseModule):
         if query_pos is not None:
             query = query + query_pos
         if not self.batch_first:
-            # change to (bs, num_query ,embed_dims)
             query = query.permute(1, 0, 2)
             value = value.permute(1, 0, 2)
-        bs,  num_query, embed_dims = query.shape
+
+        bs, num_query, embed_dims = query.shape
         _, num_value, _ = value.shape
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
         assert self.num_bev_queue == 2
 
-        query = torch.cat([value[:bs], query], -1)
+        # ---- 构建 query: 拼接上一帧 value 和当前帧 query ----
+        # 这样 query 同时包含两帧的信息
+        query = torch.cat([value[:bs], query], -1)  # (bs, num_query, 2*C)
+
+        # value 投影
         value = self.value_proj(value)
 
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
 
+        # value reshape: (bs*2, num_value, num_heads, C_per_head)
         value = value.reshape(bs*self.num_bev_queue,
                               num_value, self.num_heads, -1)
 
+        # ---- 预测采样偏移量 ----
+        # (bs, num_query, num_heads, num_bev_queue, num_levels, num_points, 2)
         sampling_offsets = self.sampling_offsets(query)
         sampling_offsets = sampling_offsets.view(
-            bs, num_query, self.num_heads,  self.num_bev_queue, self.num_levels, self.num_points, 2)
+            bs, num_query, self.num_heads, self.num_bev_queue,
+            self.num_levels, self.num_points, 2)
+
+        # ---- 预测注意力权重 ----
         attention_weights = self.attention_weights(query).view(
-            bs, num_query,  self.num_heads, self.num_bev_queue, self.num_levels * self.num_points)
+            bs, num_query, self.num_heads, self.num_bev_queue,
+            self.num_levels * self.num_points)
         attention_weights = attention_weights.softmax(-1)
 
         attention_weights = attention_weights.view(bs, num_query,
@@ -213,18 +254,22 @@ class TemporalSelfAttention(BaseModule):
                                                    self.num_levels,
                                                    self.num_points)
 
+        # 重组维度以匹配 CUDA kernel 的输入格式
+        # (bs, num_bev_queue, num_query, num_heads, num_levels, num_points)
         attention_weights = attention_weights.permute(0, 3, 1, 2, 4, 5)\
-            .reshape(bs*self.num_bev_queue, num_query, self.num_heads, self.num_levels, self.num_points).contiguous()
+            .reshape(bs*self.num_bev_queue, num_query, self.num_heads,
+                     self.num_levels, self.num_points).contiguous()
         sampling_offsets = sampling_offsets.permute(0, 3, 1, 2, 4, 5, 6)\
-            .reshape(bs*self.num_bev_queue, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+            .reshape(bs*self.num_bev_queue, num_query, self.num_heads,
+                     self.num_levels, self.num_points, 2)
 
+        # ---- 计算采样位置 ----
         if reference_points.shape[-1] == 2:
             offset_normalizer = torch.stack(
                 [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
             sampling_locations = reference_points[:, :, None, :, None, :] \
                 + sampling_offsets \
                 / offset_normalizer[None, None, None, :, None, :]
-
         elif reference_points.shape[-1] == 4:
             sampling_locations = reference_points[:, :, None, :, None, :2] \
                 + sampling_offsets / self.num_points \
@@ -234,9 +279,10 @@ class TemporalSelfAttention(BaseModule):
             raise ValueError(
                 f'Last dim of reference_points must be'
                 f' 2 or 4, but get {reference_points.shape[-1]} instead.')
-        if torch.cuda.is_available() and value.is_cuda:
 
-            # using fp16 deformable attention is unstable because it performs many sum operations
+        # ---- 执行可变形注意力 ----
+        if torch.cuda.is_available() and value.is_cuda:
+            # fp16 不稳定，统一使用 fp32
             if value.dtype == torch.float16:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             else:
@@ -245,20 +291,19 @@ class TemporalSelfAttention(BaseModule):
                 value, spatial_shapes, level_start_index, sampling_locations,
                 attention_weights, self.im2col_step)
         else:
-
             output = multi_scale_deformable_attn_pytorch(
                 value, spatial_shapes, sampling_locations, attention_weights)
 
-        # output shape (bs*num_bev_queue, num_query, embed_dims)
-        # (bs*num_bev_queue, num_query, embed_dims)-> (num_query, embed_dims, bs*num_bev_queue)
+        # ---- 融合两帧输出 ----
+        # output shape: (bs*num_bev_queue, num_query, C)
+        # → (num_query, C, bs*num_bev_queue) → (num_query, C, bs, num_bev_queue)
         output = output.permute(1, 2, 0)
-
-        # fuse history value and current value
-        # (num_query, embed_dims, bs*num_bev_queue)-> (num_query, embed_dims, bs, num_bev_queue)
         output = output.view(num_query, embed_dims, bs, self.num_bev_queue)
+
+        # 取平均融合两帧的输出
         output = output.mean(-1)
 
-        # (num_query, embed_dims, bs)-> (bs, num_query, embed_dims)
+        # (num_query, C, bs) → (bs, num_query, C)
         output = output.permute(2, 0, 1)
 
         output = self.output_proj(output)
@@ -266,4 +311,5 @@ class TemporalSelfAttention(BaseModule):
         if not self.batch_first:
             output = output.permute(1, 0, 2)
 
+        # 残差连接 + Dropout
         return self.dropout(output) + identity

@@ -1,9 +1,36 @@
-
 # ---------------------------------------------
 # Copyright (c) OpenMMLab. All rights reserved.
 # ---------------------------------------------
 #  Modified by Zhiqi Li
 # ---------------------------------------------
+
+"""
+空间交叉注意力 (Spatial Cross-Attention, SCA)
+==============================================
+负责将 BEV queries 与多视角图像特征进行交互，是 BEVFormer 的核心注意力机制。
+
+包含两个类:
+1. SpatialCrossAttention:    空间交叉注意力的高层封装
+   负责将 BEV query 通过投影参考点与对应相机图像的特征交互
+
+2. MSDeformableAttention3D:  3D 可变形注意力的底层实现
+   负责在图像特征上以可变形方式采样特征并聚合
+
+SCA 的核心流程:
+    BEV Query (3D 空间中的查询点)
+        │
+        ├── Step 1: 参考点投影
+        │   └── 将 3D BEV 参考点通过 lidar2img 矩阵投影到各相机图像平面
+        │
+        ├── Step 2: 按相机分组
+        │   └── 每个 BEV query 只与能"看到"它的相机交互 (节省 GPU 显存)
+        │
+        ├── Step 3: 可变形注意力
+        │   └── 在图像特征上采样参考点周围的区域
+        │
+        └── Step 4: 多相机聚合
+            └── 对多个相机的输出取平均，得到最终的 BEV query 特征
+"""
 
 from mmcv.ops.multi_scale_deform_attn import multi_scale_deformable_attn_pytorch
 import warnings
@@ -29,16 +56,23 @@ ext_module = ext_loader.load_ext(
 
 @ATTENTION.register_module()
 class SpatialCrossAttention(BaseModule):
-    """An attention module used in BEVFormer.
+    """空间交叉注意力 (SCA)
+
+    将 BEV 空间中的查询点投影到多视角图像上，在对应图像特征上采样。
+    这是 BEVFormer 实现图像特征 → BEV 特征转换的核心机制。
+
+    关键设计:
+    1. 按相机分组: 每个 BEV query 只与能"看到"它的相机交互
+       这大大减少了计算量，因为大多数 BEV 点只有 2-3 个相机能看到
+    2. 多相机特征平均: 对不同相机的输出取平均而非求和
+       避免因可见相机数量不同导致的特征尺度不一致
+
     Args:
-        embed_dims (int): The embedding dimension of Attention.
-            Default: 256.
-        num_cams (int): The number of cameras
-        dropout (float): A Dropout layer on `inp_residual`.
-            Default: 0..
-        init_cfg (obj:`mmcv.ConfigDict`): The Config for initialization.
-            Default: None.
-        deformable_attention: (dict): The config for the deformable attention used in SCA.
+        embed_dims: 特征嵌入维度，默认 256
+        num_cams: 相机数量，默认 6 (nuScenes 的 6 视角)
+        pc_range: 点云范围，用于 3D 参考点投影
+        dropout: Dropout 概率
+        deformable_attention: 底层可变形注意力模块的配置
     """
 
     def __init__(self,
@@ -60,17 +94,21 @@ class SpatialCrossAttention(BaseModule):
         self.dropout = nn.Dropout(dropout)
         self.pc_range = pc_range
         self.fp16_enabled = False
+
+        # 底层的可变形注意力模块
         self.deformable_attention = build_attention(deformable_attention)
         self.embed_dims = embed_dims
         self.num_cams = num_cams
+
+        # 输出投影层
         self.output_proj = nn.Linear(embed_dims, embed_dims)
         self.batch_first = batch_first
         self.init_weight()
 
     def init_weight(self):
-        """Default initialization for Parameters of Module."""
+        """初始化输出投影层权重"""
         xavier_init(self.output_proj, distribution='uniform', bias=0.)
-    
+
     @force_fp32(apply_to=('query', 'key', 'value', 'query_pos', 'reference_points_cam'))
     def forward(self,
                 query,
@@ -86,37 +124,25 @@ class SpatialCrossAttention(BaseModule):
                 level_start_index=None,
                 flag='encoder',
                 **kwargs):
-        """Forward Function of Detr3DCrossAtten.
+        """空间交叉注意力前向传播
+
+        核心流程:
+        1. 根据 bev_mask 确定每个 BEV query 对哪些相机可见
+        2. 按相机重新分组 query 和参考点 (rebatch)
+        3. 在每个相机上执行可变形注意力
+        4. 将多相机结果聚合回 BEV 空间
+
         Args:
-            query (Tensor): Query of Transformer with shape
-                (num_query, bs, embed_dims).
-            key (Tensor): The key tensor with shape
-                `(num_key, bs, embed_dims)`.
-            value (Tensor): The value tensor with shape
-                `(num_key, bs, embed_dims)`. (B, N, C, H, W)
-            residual (Tensor): The tensor used for addition, with the
-                same shape as `x`. Default None. If None, `x` will be used.
-            query_pos (Tensor): The positional encoding for `query`.
-                Default: None.
-            key_pos (Tensor): The positional encoding for  `key`. Default
-                None.
-            reference_points (Tensor):  The normalized reference
-                points with shape (bs, num_query, 4),
-                all elements is range in [0, 1], top-left (0,0),
-                bottom-right (1, 1), including padding area.
-                or (N, Length_{query}, num_levels, 4), add
-                additional two dimensions is (w, h) to
-                form reference boxes.
-            key_padding_mask (Tensor): ByteTensor for `query`, with
-                shape [bs, num_key].
-            spatial_shapes (Tensor): Spatial shape of features in
-                different level. With shape  (num_levels, 2),
-                last dimension represent (h, w).
-            level_start_index (Tensor): The start index of each level.
-                A tensor has shape (num_levels) and can be represented
-                as [0, h_0*w_0, h_0*w_0+h_1*w_1, ...].
+            query: BEV 查询 (bs, num_query, C)  -- batch_first=True
+            key/value: 图像特征 (num_cam, ΣH*W, bs, C)
+            reference_points: 3D 参考点 (bs, num_query, ...)
+            reference_points_cam: 投影到图像平面的参考点 (num_cam, bs, num_query, D, 2)
+            bev_mask: 每个 BEV 点在各相机上的可见性 (num_cam, bs, num_query, D)
+            spatial_shapes: 多尺度图像特征的空间形状
+            level_start_index: 多尺度特征起始索引
+
         Returns:
-             Tensor: forwarded results with shape [num_query, bs, embed_dims].
+            slots: 更新后的 BEV 特征 (bs, num_query, C)
         """
 
         if key is None:
@@ -126,49 +152,79 @@ class SpatialCrossAttention(BaseModule):
 
         if residual is None:
             inp_residual = query
-            slots = torch.zeros_like(query)
+            slots = torch.zeros_like(query)  # 用于累积多相机输出
         if query_pos is not None:
             query = query + query_pos
 
         bs, num_query, _ = query.size()
 
+        # ============================================================
+        # Step 1: 按相机分组 - 确定每个 BEV query 对哪些相机可见
+        # ============================================================
+        # bev_mask: (num_cam, bs, num_query, D) 其中 D 是每个 pillar 的采样点数
+        # 对于每个相机，找出所有能被该相机看到的 BEV queries
         D = reference_points_cam.size(3)
         indexes = []
         for i, mask_per_img in enumerate(bev_mask):
+            # 找到在相机 i 中可见的 BEV query 索引
             index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
             indexes.append(index_query_per_img)
         max_len = max([len(each) for each in indexes])
 
-        # each camera only interacts with its corresponding BEV queries. This step can  greatly save GPU memory.
+        # ============================================================
+        # Step 2: Rebatch - 按相机重新组织 query 和参考点
+        # ============================================================
+        # 每个相机只与能"看到"的 BEV queries 交互，大大节省 GPU 显存
+        # queries_rebatch: (bs, num_cams, max_len, C)
         queries_rebatch = query.new_zeros(
             [bs, self.num_cams, max_len, self.embed_dims])
+        # reference_points_rebatch: (bs, num_cams, max_len, D, 2)
         reference_points_rebatch = reference_points_cam.new_zeros(
             [bs, self.num_cams, max_len, D, 2])
-        
+
         for j in range(bs):
-            for i, reference_points_per_img in enumerate(reference_points_cam):   
+            for i, reference_points_per_img in enumerate(reference_points_cam):
                 index_query_per_img = indexes[i]
                 queries_rebatch[j, i, :len(index_query_per_img)] = query[j, index_query_per_img]
                 reference_points_rebatch[j, i, :len(index_query_per_img)] = reference_points_per_img[j, index_query_per_img]
 
+        # ============================================================
+        # Step 3: 可变形注意力 - 在每个相机上采样图像特征
+        # ============================================================
+        # 将 key/value 从 (num_cam, l, bs, C) 变换为 (bs*num_cams, l, C)
         num_cams, l, bs, embed_dims = key.shape
-
         key = key.permute(2, 0, 1, 3).reshape(
             bs * self.num_cams, l, self.embed_dims)
         value = value.permute(2, 0, 1, 3).reshape(
             bs * self.num_cams, l, self.embed_dims)
 
-        queries = self.deformable_attention(query=queries_rebatch.view(bs*self.num_cams, max_len, self.embed_dims), key=key, value=value,
-                                            reference_points=reference_points_rebatch.view(bs*self.num_cams, max_len, D, 2), spatial_shapes=spatial_shapes,
-                                            level_start_index=level_start_index).view(bs, self.num_cams, max_len, self.embed_dims)
+        # 在图像特征上执行可变形注意力
+        # query: (bs*num_cams, max_len, C)
+        # key/value: (bs*num_cams, l, C)  -- 多尺度图像特征
+        # reference_points: (bs*num_cams, max_len, D, 2) -- 投影后的图像坐标
+        queries = self.deformable_attention(
+            query=queries_rebatch.view(bs*self.num_cams, max_len, self.embed_dims),
+            key=key, value=value,
+            reference_points=reference_points_rebatch.view(bs*self.num_cams, max_len, D, 2),
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index).view(bs, self.num_cams, max_len, self.embed_dims)
+
+        # ============================================================
+        # Step 4: 多相机聚合 - 将各相机输出累加回 BEV 空间
+        # ============================================================
         for j in range(bs):
             for i, index_query_per_img in enumerate(indexes):
                 slots[j, index_query_per_img] += queries[j, i, :len(index_query_per_img)]
 
+        # 计算每个 BEV query 被多少个相机看到
         count = bev_mask.sum(-1) > 0
         count = count.permute(1, 2, 0).sum(-1)
         count = torch.clamp(count, min=1.0)
+
+        # 取平均 (而非求和)，避免可见相机数量不同的影响
         slots = slots / count[..., None]
+
+        # 输出投影
         slots = self.output_proj(slots)
 
         return self.dropout(slots) + inp_residual
@@ -176,28 +232,29 @@ class SpatialCrossAttention(BaseModule):
 
 @ATTENTION.register_module()
 class MSDeformableAttention3D(BaseModule):
-    """An attention module used in BEVFormer based on Deformable-Detr.
-    `Deformable DETR: Deformable Transformers for End-to-End Object Detection.
-    <https://arxiv.org/pdf/2010.04159.pdf>`_.
+    """3D 可变形注意力模块
+
+    用于空间交叉注意力 (SCA) 的底层实现。
+    在图像特征上以可变形方式采样，支持多尺度特征和 3D 参考点投影。
+
+    与 Decoder 中的 CustomMSDeformableAttention 的区别:
+    - 这里用于 Encoder 的 SCA (query=BEV, key/value=图像特征)
+    - 支持 3D 参考点 (高度维度采样)
+    - 每个 BEV query 有 num_Z_anchors 个不同高度的参考点
+
+    3D 参考点采样:
+    每个 BEV grid 位置在高度方向上有 num_Z_anchors 个采样点。
+    在投影到图像后，每个采样点对应图像上的一个位置。
+    总共 num_points * num_Z_anchors 个采样点。
+
     Args:
-        embed_dims (int): The embedding dimension of Attention.
-            Default: 256.
-        num_heads (int): Parallel attention heads. Default: 64.
-        num_levels (int): The number of feature map used in
-            Attention. Default: 4.
-        num_points (int): The number of sampling points for
-            each query in each head. Default: 4.
-        im2col_step (int): The step used in image_to_column.
-            Default: 64.
-        dropout (float): A Dropout layer on `inp_identity`.
-            Default: 0.1.
-        batch_first (bool): Key, Query and Value are shape of
-            (batch, n, embed_dim)
-            or (n, batch, embed_dim). Default to False.
-        norm_cfg (dict): Config dict for normalization layer.
-            Default: None.
-        init_cfg (obj:`mmcv.ConfigDict`): The Config for initialization.
-            Default: None.
+        embed_dims: 特征嵌入维度，默认 256
+        num_heads: 注意力头数，默认 8
+        num_levels: 多尺度特征层数，默认 4 (FPN 的 4 个尺度)
+        num_points: 每个 query 在每个 head 的采样点数，默认 8
+        im2col_step: CUDA 实现的并行参数
+        dropout: Dropout 概率
+        batch_first: 是否 batch 维度在第一维
     """
 
     def __init__(self,
@@ -220,8 +277,6 @@ class MSDeformableAttention3D(BaseModule):
         self.output_proj = None
         self.fp16_enabled = False
 
-        # you'd better set dim_per_head to a power of 2
-        # which is more efficient in the CUDA implementation
         def _is_power_of_2(n):
             if (not isinstance(n, int)) or (n < 0):
                 raise ValueError(
@@ -241,16 +296,27 @@ class MSDeformableAttention3D(BaseModule):
         self.num_levels = num_levels
         self.num_heads = num_heads
         self.num_points = num_points
+
+        # 预测采样偏移量 (每个采样点 2D 偏移)
         self.sampling_offsets = nn.Linear(
             embed_dims, num_heads * num_levels * num_points * 2)
+
+        # 预测注意力权重
         self.attention_weights = nn.Linear(embed_dims,
                                            num_heads * num_levels * num_points)
+
+        # value 特征投影
         self.value_proj = nn.Linear(embed_dims, embed_dims)
 
         self.init_weights()
 
     def init_weights(self):
-        """Default initialization for Parameters of Module."""
+        """初始化权重
+
+        - sampling_offsets: bias 初始化为放射状分布
+        - attention_weights: 初始化为 0 (均匀注意力)
+        - value_proj 和 output_proj: Xavier 均匀初始化
+        """
         constant_init(self.sampling_offsets, 0.)
         thetas = torch.arange(
             self.num_heads,
@@ -280,38 +346,20 @@ class MSDeformableAttention3D(BaseModule):
                 spatial_shapes=None,
                 level_start_index=None,
                 **kwargs):
-        """Forward Function of MultiScaleDeformAttention.
+        """3D 可变形注意力前向传播
+
+        支持 3D 参考点: 每个 BEV query 在高度方向上有 num_Z_anchors 个采样点。
+        投影到图像后，每个 3D 参考点对应图像上的一个 2D 位置。
+
         Args:
-            query (Tensor): Query of Transformer with shape
-                ( bs, num_query, embed_dims).
-            key (Tensor): The key tensor with shape
-                `(bs, num_key,  embed_dims)`.
-            value (Tensor): The value tensor with shape
-                `(bs, num_key,  embed_dims)`.
-            identity (Tensor): The tensor used for addition, with the
-                same shape as `query`. Default None. If None,
-                `query` will be used.
-            query_pos (Tensor): The positional encoding for `query`.
-                Default: None.
-            key_pos (Tensor): The positional encoding for `key`. Default
-                None.
-            reference_points (Tensor):  The normalized reference
-                points with shape (bs, num_query, num_levels, 2),
-                all elements is range in [0, 1], top-left (0,0),
-                bottom-right (1, 1), including padding area.
-                or (N, Length_{query}, num_levels, 4), add
-                additional two dimensions is (w, h) to
-                form reference boxes.
-            key_padding_mask (Tensor): ByteTensor for `query`, with
-                shape [bs, num_key].
-            spatial_shapes (Tensor): Spatial shape of features in
-                different levels. With shape (num_levels, 2),
-                last dimension represents (h, w).
-            level_start_index (Tensor): The start index of each level.
-                A tensor has shape ``(num_levels, )`` and can be represented
-                as [0, h_0*w_0, h_0*w_0+h_1*w_1, ...].
+            query: 查询向量 (bs, num_query, C)
+            key/value: 图像特征 (bs, num_value, C)
+            reference_points: 归一化 3D 参考点 (bs, num_query, num_Z_anchors, 2)
+            spatial_shapes: 多尺度特征空间形状
+            level_start_index: 多尺度特征起始索引
+
         Returns:
-             Tensor: forwarded results with shape [num_query, bs, embed_dims].
+            output: 注意力输出 (bs, num_query, C)
         """
 
         if value is None:
@@ -322,7 +370,6 @@ class MSDeformableAttention3D(BaseModule):
             query = query + query_pos
 
         if not self.batch_first:
-            # change to (bs, num_query ,embed_dims)
             query = query.permute(1, 0, 2)
             value = value.permute(1, 0, 2)
 
@@ -334,8 +381,12 @@ class MSDeformableAttention3D(BaseModule):
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
         value = value.view(bs, num_value, self.num_heads, -1)
+
+        # 预测采样偏移量: (bs, num_query, num_heads, num_levels, num_points, 2)
         sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+
+        # 预测注意力权重: (bs, num_query, num_heads, num_levels * num_points)
         attention_weights = self.attention_weights(query).view(
             bs, num_query, self.num_heads, self.num_levels * self.num_points)
 
@@ -346,27 +397,38 @@ class MSDeformableAttention3D(BaseModule):
                                                    self.num_levels,
                                                    self.num_points)
 
+        # ---- 计算采样位置 ----
+        # reference_points 形状: (bs, num_query, num_Z_anchors, 2)
+        # 其中 num_Z_anchors 是每个 BEV query 在高度方向的采样点数
         if reference_points.shape[-1] == 2:
             """
-            For each BEV query, it owns `num_Z_anchors` in 3D space that having different heights.
-            After proejcting, each BEV query has `num_Z_anchors` reference points in each 2D image.
-            For each referent point, we sample `num_points` sampling points.
-            For `num_Z_anchors` reference points,  it has overall `num_points * num_Z_anchors` sampling points.
+            对于每个 BEV query，它在 3D 空间中有 num_Z_anchors 个不同高度的采样点。
+            投影到每个 2D 图像后，每个采样点对应图像上的一个位置。
+            每个参考点周围采样 num_points 个点。
             """
             offset_normalizer = torch.stack(
                 [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
 
             bs, num_query, num_Z_anchors, xy = reference_points.shape
+            # 扩展维度: (bs, num_query, 1, 1, 1, num_Z_anchors, 2)
             reference_points = reference_points[:, :, None, None, None, :, :]
+
+            # 归一化偏移量
             sampling_offsets = sampling_offsets / \
                 offset_normalizer[None, None, None, :, None, :]
+
+            # 将采样偏移量按 num_Z_anchors 分组
             bs, num_query, num_heads, num_levels, num_all_points, xy = sampling_offsets.shape
             sampling_offsets = sampling_offsets.view(
-                bs, num_query, num_heads, num_levels, num_all_points // num_Z_anchors, num_Z_anchors, xy)
+                bs, num_query, num_heads, num_levels,
+                num_all_points // num_Z_anchors, num_Z_anchors, xy)
+
+            # 采样位置 = 参考点 + 偏移量
             sampling_locations = reference_points + sampling_offsets
             bs, num_query, num_heads, num_levels, num_points, num_Z_anchors, xy = sampling_locations.shape
             assert num_all_points == num_points * num_Z_anchors
 
+            # 合并 num_points 和 num_Z_anchors 维度
             sampling_locations = sampling_locations.view(
                 bs, num_query, num_heads, num_levels, num_all_points, xy)
 
@@ -377,10 +439,7 @@ class MSDeformableAttention3D(BaseModule):
                 f'Last dim of reference_points must be'
                 f' 2 or 4, but get {reference_points.shape[-1]} instead.')
 
-        #  sampling_locations.shape: bs, num_query, num_heads, num_levels, num_all_points, 2
-        #  attention_weights.shape: bs, num_query, num_heads, num_levels, num_all_points
-        #
-
+        # 执行可变形注意力 (CUDA 加速)
         if torch.cuda.is_available() and value.is_cuda:
             if value.dtype == torch.float16:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32

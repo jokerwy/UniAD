@@ -4,6 +4,34 @@
 #  Modified by Zhiqi Li
 # ---------------------------------------------
 
+"""
+检测 Decoder (DetectionTransformerDecoder)
+===========================================
+负责在 BEV 特征上进行 3D 目标检测。由多层 Transformer Decoder Layer 堆叠而成，
+每层包含自注意力和可变形交叉注意力，并逐层迭代 refine 检测框位置。
+
+核心流程 (Decoder 单层):
+    Object Query (可学习的目标查询向量)
+        │
+        ├── 自注意力 (Self-Attention): 300 个 queries 之间交互
+        │   └── 避免多个 queries 检测同一个目标
+        │
+        ├── 交叉注意力 (Cross-Attention): query 在 BEV 特征上采样
+        │   └── 通过可变形注意力在参考点周围采样 BEV 特征
+        │
+        └── 回归分支: 更新参考点位置
+            └── 预测的偏移量加到当前参考点上，作为下一层 decoder 的输入
+
+逐层 refine 机制:
+    Layer 0: 初始参考点 → 预测偏移 → 更新参考点
+    Layer 1: 更新后的参考点 → 预测偏移 → 再次更新
+    ...
+    Layer 5: 最终参考点 → 最终检测框
+
+CustomMSDeformableAttention:
+    底层的可变形注意力实现，支持在 BEV 特征图上灵活采样。
+"""
+
 from mmcv.ops.multi_scale_deform_attn import multi_scale_deformable_attn_pytorch
 import mmcv
 import cv2 as cv
@@ -32,16 +60,19 @@ ext_module = ext_loader.load_ext(
 
 
 def inverse_sigmoid(x, eps=1e-5):
-    """Inverse function of sigmoid.
+    """Sigmoid 的反函数
+
+    将 [0, 1] 范围内的值映射回无约束空间。
+    用于在 Decoder 层之间传递参考点时，保持数值稳定性。
+
+    inverse_sigmoid(sigmoid(x)) = x
+
     Args:
-        x (Tensor): The tensor to do the
-            inverse.
-        eps (float): EPS avoid numerical
-            overflow. Defaults 1e-5.
+        x: 输入值，范围 [0, 1]
+        eps: 防止数值溢出的最小值
+
     Returns:
-        Tensor: The x has passed the inverse
-            function of sigmoid, has same
-            shape with input.
+        inverse sigmoid 变换后的值
     """
     x = x.clamp(min=0, max=1)
     x1 = x.clamp(min=eps)
@@ -51,11 +82,23 @@ def inverse_sigmoid(x, eps=1e-5):
 
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
 class DetectionTransformerDecoder(TransformerLayerSequence):
-    """Implements the decoder in DETR3D transformer.
+    """检测 Transformer Decoder
+
+    由多层 Decoder Layer 堆叠而成，每层包含:
+    1. 自注意力: 300 个 object queries 之间交互，避免检测冲突
+    2. 交叉注意力: queries 在 BEV 特征上做可变形注意力
+    3. FFN: 特征变换
+    4. 回归分支: 逐层 refine 参考点位置 (with_box_refine=True 时)
+
+    逐层 refine 的设计思路:
+    - 初始参考点是对目标位置的粗略估计
+    - 每层 Decoder 预测一个偏移量，加到当前参考点上
+    - 下一层 Decoder 使用更新后的参考点，在更精确的位置采样
+    - 经过 6 层迭代，参考点逐渐收敛到目标的真实位置
+
     Args:
-        return_intermediate (bool): Whether to return intermediate outputs.
-        coder_norm_cfg (dict): Config of last normalization layer. Default：
-            `LN`.
+        return_intermediate: 是否返回所有中间层的输出
+            True → 返回 (num_layers, num_query, bs, C) 用于逐层监督
     """
 
     def __init__(self, *args, return_intermediate=False, **kwargs):
@@ -70,30 +113,37 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
                 reg_branches=None,
                 key_padding_mask=None,
                 **kwargs):
-        """Forward function for `Detr3DTransformerDecoder`.
+        """Decoder 前向传播
+
+        逐层处理 object queries，每层:
+        1. 在 BEV 特征上做交叉注意力
+        2. 通过回归分支预测偏移量，更新参考点
+
         Args:
-            query (Tensor): Input query with shape
-                `(num_query, bs, embed_dims)`.
-            reference_points (Tensor): The reference
-                points of offset. has shape
-                (bs, num_query, 4) when as_two_stage,
-                otherwise has shape ((bs, num_query, 2).
-            reg_branch: (obj:`nn.ModuleList`): Used for
-                refining the regression results. Only would
-                be passed when with_box_refine is True,
-                otherwise would be passed a `None`.
+            query: object queries (num_query, bs, C)
+            reference_points: 初始 3D 参考点 (bs, num_query, 3)
+                在 [0, 1] 范围内，分别表示归一化的 cx, cy, cz
+            reg_branches: 回归分支模块列表 (每层 decoder 一个)
+                用于预测参考点的偏移量
+            key_padding_mask: key 的 padding 掩码
+
         Returns:
-            Tensor: Results with shape [1, num_query, bs, embed_dims] when
-                return_intermediate is `False`, otherwise it has shape
-                [num_layers, num_query, bs, embed_dims].
+            output: Decoder 各层输出
+                (num_layers, num_query, bs, C) 如果 return_intermediate=True
+            reference_points: 各层更新后的参考点
+                (num_layers, bs, num_query, 3) 如果 return_intermediate=True
         """
         output = query
         intermediate = []
         intermediate_reference_points = []
-        for lid, layer in enumerate(self.layers):
 
+        for lid, layer in enumerate(self.layers):
+            # 取参考点的前 2 维 (cx, cy) 作为 2D 参考点
+            # (BS, NUM_QUERY, 3) → (BS, NUM_QUERY, 1, 2)
             reference_points_input = reference_points[..., :2].unsqueeze(
-                2)  # BS NUM_QUERY NUM_LEVEL 2
+                2)
+
+            # Decoder 层前向传播: 自注意力 + 交叉注意力 + FFN
             output = layer(
                 output,
                 *args,
@@ -102,11 +152,19 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
                 **kwargs)
             output = output.permute(1, 0, 2)
 
+            # 逐层 refine 参考点: 每层预测偏移量并更新参考点
             if reg_branches is not None:
+                # 回归分支预测偏移量: (bs, num_query, 10)
+                # tmp[0:2] = Δcx, Δcy → 用于更新参考点
+                # tmp[4:5] = Δcz → 用于更新参考点高度
                 tmp = reg_branches[lid](output)
 
                 assert reference_points.shape[-1] == 3
 
+                # 计算新的参考点:
+                # new_cx = sigmoid(Δcx + inverse_sigmoid(old_cx))
+                # new_cy = sigmoid(Δcy + inverse_sigmoid(old_cy))
+                # new_cz = sigmoid(Δcz + inverse_sigmoid(old_cz))
                 new_reference_points = torch.zeros_like(reference_points)
                 new_reference_points[..., :2] = tmp[
                     ..., :2] + inverse_sigmoid(reference_points[..., :2])
@@ -115,6 +173,7 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
 
                 new_reference_points = new_reference_points.sigmoid()
 
+                # detach: 参考点更新不参与梯度传播到上一层
                 reference_points = new_reference_points.detach()
 
             output = output.permute(1, 0, 2)
@@ -131,30 +190,29 @@ class DetectionTransformerDecoder(TransformerLayerSequence):
 
 @ATTENTION.register_module()
 class CustomMSDeformableAttention(BaseModule):
-    """An attention module used in Deformable-Detr.
+    """Decoder 中使用的可变形注意力模块
 
-    `Deformable DETR: Deformable Transformers for End-to-End Object Detection.
-    <https://arxiv.org/pdf/2010.04159.pdf>`_.
+    基于 Deformable DETR 的可变形注意力机制实现。
+    与 Encoder 中的交叉注意力不同，这里的 query 是 object queries，
+    key/value 是 BEV 特征。
+
+    工作原理:
+    1. 对于每个 query，根据其参考点在 BEV 特征上采样 num_points 个点
+    2. 通过 sampling_offsets 预测每个采样点的偏移量
+    3. 通过 attention_weights 对采样点做加权聚合
+    4. 输出投影后与残差相加
+
+    这允许每个 object query 灵活地关注 BEV 特征中与目标相关的区域，
+    而不局限于固定的网格采样。
 
     Args:
-        embed_dims (int): The embedding dimension of Attention.
-            Default: 256.
-        num_heads (int): Parallel attention heads. Default: 64.
-        num_levels (int): The number of feature map used in
-            Attention. Default: 4.
-        num_points (int): The number of sampling points for
-            each query in each head. Default: 4.
-        im2col_step (int): The step used in image_to_column.
-            Default: 64.
-        dropout (float): A Dropout layer on `inp_identity`.
-            Default: 0.1.
-        batch_first (bool): Key, Query and Value are shape of
-            (batch, n, embed_dim)
-            or (n, batch, embed_dim). Default to False.
-        norm_cfg (dict): Config dict for normalization layer.
-            Default: None.
-        init_cfg (obj:`mmcv.ConfigDict`): The Config for initialization.
-            Default: None.
+        embed_dims: 特征嵌入维度，默认 256
+        num_heads: 注意力头数，默认 8
+        num_levels: 多尺度特征层数，Decoder 中通常为 1 (只有 BEV 特征)
+        num_points: 每个 query 在每个 head 的采样点数，默认 4
+        im2col_step: 图像到列的步长，影响 CUDA 实现的并行度
+        dropout: Dropout 概率
+        batch_first: 是否 batch 维度在第一维
     """
 
     def __init__(self,
@@ -177,8 +235,7 @@ class CustomMSDeformableAttention(BaseModule):
         self.batch_first = batch_first
         self.fp16_enabled = False
 
-        # you'd better set dim_per_head to a power of 2
-        # which is more efficient in the CUDA implementation
+        # 每个注意力头的维度需要是 2 的幂次，CUDA 实现更高效
         def _is_power_of_2(n):
             if (not isinstance(n, int)) or (n < 0):
                 raise ValueError(
@@ -198,16 +255,32 @@ class CustomMSDeformableAttention(BaseModule):
         self.num_levels = num_levels
         self.num_heads = num_heads
         self.num_points = num_points
+
+        # sampling_offsets: 预测每个采样点相对于参考点的偏移量
+        # 输出维度: num_heads * num_levels * num_points * 2 (每个点 2D 偏移)
         self.sampling_offsets = nn.Linear(
             embed_dims, num_heads * num_levels * num_points * 2)
+
+        # attention_weights: 预测每个采样点的注意力权重
+        # 输出维度: num_heads * num_levels * num_points
         self.attention_weights = nn.Linear(embed_dims,
                                            num_heads * num_levels * num_points)
+
+        # value_proj: 将 value 特征投影到注意力空间
         self.value_proj = nn.Linear(embed_dims, embed_dims)
+
+        # output_proj: 将注意力输出投影回原始空间
         self.output_proj = nn.Linear(embed_dims, embed_dims)
         self.init_weights()
 
     def init_weights(self):
-        """Default initialization for Parameters of Module."""
+        """初始化权重
+
+        - sampling_offsets: bias 初始化为放射状分布 (不同 head 朝向不同角度)
+            这样初始时每个注意力头关注参考点周围不同方向的特征
+        - attention_weights: 初始化为 0 (经过 softmax 后变为均匀注意力)
+        - value_proj 和 output_proj: Xavier 均匀初始化
+        """
         constant_init(self.sampling_offsets, 0.)
         thetas = torch.arange(
             self.num_heads,
@@ -226,8 +299,6 @@ class CustomMSDeformableAttention(BaseModule):
         xavier_init(self.output_proj, distribution='uniform', bias=0.)
         self._is_init = True
 
-    @deprecated_api_warning({'residual': 'identity'},
-                            cls_name='MultiScaleDeformableAttention')
     def forward(self,
                 query,
                 key=None,
@@ -240,51 +311,34 @@ class CustomMSDeformableAttention(BaseModule):
                 level_start_index=None,
                 flag='decoder',
                 **kwargs):
-        """Forward Function of MultiScaleDeformAttention.
+        """可变形注意力前向传播
+
+        核心流程:
+        1. 根据 query 预测采样偏移量和注意力权重
+        2. 在参考点周围采样 BEV 特征
+        3. 加权聚合采样特征
+        4. 输出投影 + 残差连接
 
         Args:
-            query (Tensor): Query of Transformer with shape
-                (num_query, bs, embed_dims).
-            key (Tensor): The key tensor with shape
-                `(num_key, bs, embed_dims)`.
-            value (Tensor): The value tensor with shape
-                `(num_key, bs, embed_dims)`.
-            identity (Tensor): The tensor used for addition, with the
-                same shape as `query`. Default None. If None,
-                `query` will be used.
-            query_pos (Tensor): The positional encoding for `query`.
-                Default: None.
-            key_pos (Tensor): The positional encoding for `key`. Default
-                None.
-            reference_points (Tensor):  The normalized reference
-                points with shape (bs, num_query, num_levels, 2),
-                all elements is range in [0, 1], top-left (0,0),
-                bottom-right (1, 1), including padding area.
-                or (N, Length_{query}, num_levels, 4), add
-                additional two dimensions is (w, h) to
-                form reference boxes.
-            key_padding_mask (Tensor): ByteTensor for `query`, with
-                shape [bs, num_key].
-            spatial_shapes (Tensor): Spatial shape of features in
-                different levels. With shape (num_levels, 2),
-                last dimension represents (h, w).
-            level_start_index (Tensor): The start index of each level.
-                A tensor has shape ``(num_levels, )`` and can be represented
-                as [0, h_0*w_0, h_0*w_0+h_1*w_1, ...].
+            query: 查询向量 (num_query, bs, C) 或 (bs, num_query, C)
+            key/value: BEV 特征 (num_bev, bs, C) 或 (bs, num_bev, C)
+            identity: 残差连接的输入
+            query_pos: 查询位置编码
+            reference_points: 归一化参考点 (bs, num_query, num_levels, 2)
+            spatial_shapes: BEV 特征图的空间形状
+            level_start_index: 多尺度特征起始索引
 
         Returns:
-             Tensor: forwarded results with shape [num_query, bs, embed_dims].
+            output: 注意力输出 (num_query, bs, C) 或 (bs, num_query, C)
         """
 
         if value is None:
             value = query
-
         if identity is None:
             identity = query
         if query_pos is not None:
             query = query + query_pos
         if not self.batch_first:
-            # change to (bs, num_query ,embed_dims)
             query = query.permute(1, 0, 2)
             value = value.permute(1, 0, 2)
 
@@ -292,13 +346,17 @@ class CustomMSDeformableAttention(BaseModule):
         bs, num_value, _ = value.shape
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
+        # 将 value 投影到多头注意力空间
         value = self.value_proj(value)
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
         value = value.view(bs, num_value, self.num_heads, -1)
 
+        # 预测采样偏移量: (bs, num_query, num_heads, num_levels, num_points, 2)
         sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+
+        # 预测注意力权重: (bs, num_query, num_heads, num_levels * num_points)
         attention_weights = self.attention_weights(query).view(
             bs, num_query, self.num_heads, self.num_levels * self.num_points)
         attention_weights = attention_weights.softmax(-1)
@@ -307,6 +365,8 @@ class CustomMSDeformableAttention(BaseModule):
                                                    self.num_heads,
                                                    self.num_levels,
                                                    self.num_points)
+
+        # 计算实际采样位置: 参考点 + 偏移量
         if reference_points.shape[-1] == 2:
             offset_normalizer = torch.stack(
                 [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
@@ -322,9 +382,10 @@ class CustomMSDeformableAttention(BaseModule):
             raise ValueError(
                 f'Last dim of reference_points must be'
                 f' 2 or 4, but get {reference_points.shape[-1]} instead.')
-        if torch.cuda.is_available() and value.is_cuda:
 
-            # using fp16 deformable attention is unstable because it performs many sum operations
+        # 执行可变形注意力 (CUDA 加速或 PyTorch 实现)
+        if torch.cuda.is_available() and value.is_cuda:
+            # fp16 的可变形注意力不稳定 (多次求和累积误差)，统一使用 fp32
             if value.dtype == torch.float16:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             else:
@@ -339,7 +400,7 @@ class CustomMSDeformableAttention(BaseModule):
         output = self.output_proj(output)
 
         if not self.batch_first:
-            # (num_query, bs ,embed_dims)
             output = output.permute(1, 0, 2)
 
+        # 残差连接 + Dropout
         return self.dropout(output) + identity

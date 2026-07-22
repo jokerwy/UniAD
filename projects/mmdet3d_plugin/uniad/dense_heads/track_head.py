@@ -1,9 +1,20 @@
-#---------------------------------------------------------------------------------#
-# UniAD: Planning-oriented Autonomous Driving (https://arxiv.org/abs/2212.10156)  #
-# Source code: https://github.com/OpenDriveLab/UniAD                              #
-# Copyright (c) OpenDriveLab. All rights reserved.                                #
-# Modified from bevformer (https://github.com/fundamentalvision/BEVFormer)        #
-#---------------------------------------------------------------------------------#
+"""
+BEVFormer 跟踪检测头 (BEVFormerTrackHead)
+==========================================
+继承自 DETRHead，在 BEVFormerHead 的基础上增加了轨迹预测分支。
+
+与 BEVFormerHead 的主要区别:
+    1. 增加了 past_traj_reg_branches: 预测每个目标的过去轨迹
+    2. 使用 get_detections() 而非 forward() 进行检测
+       因为 track 模式下 query 来自上一个跟踪实例，而非固定的 query_embedding
+    3. 不包含 query_embedding (由外部 track_instances 提供)
+    4. 输出中包含 last_ref_points 和 query_feats
+       用于速度更新和 Memory Bank 存储
+
+轨迹预测:
+    past_traj_reg_branch 输出 (past_steps + fut_steps, 2) 维轨迹
+    表示过去 past_steps 帧 + 未来 fut_steps 帧的 (x, y) 位置
+"""
 
 import copy
 import torch
@@ -23,15 +34,20 @@ from mmcv.runner import force_fp32, auto_fp16
 
 @HEADS.register_module()
 class BEVFormerTrackHead(DETRHead):
-    """Head of Detr3D.
+    """BEVFormer 跟踪检测头
+
+    在基础检测功能上增加了轨迹预测分支，用于跟踪任务。
+
+    核心功能:
+    1. BEV 特征生成 (get_bev_features)
+    2. 目标检测 (get_detections)
+    3. 轨迹预测 (past_traj_reg_branches)
+    4. 损失计算 (loss)
+
     Args:
-        with_box_refine (bool): Whether to refine the reference points
-            in the decoder. Defaults to False.
-        as_two_stage (bool) : Whether to generate the proposal from
-            the outputs of encoder.
-        transformer (obj:`ConfigDict`): ConfigDict is used for building
-            the Encoder and Decoder.
-        bev_h, bev_w (int): spatial shape of BEV queries.
+        with_box_refine: 是否逐层 refine 框
+        past_steps: 过去轨迹步数 (默认 4，对应 2 秒)
+        fut_steps: 未来轨迹步数 (默认 4，对应 2 秒)
     """
 
     def __init__(self,
@@ -44,8 +60,8 @@ class BEVFormerTrackHead(DETRHead):
                  code_weights=None,
                  bev_h=30,
                  bev_w=30,
-                 past_steps=4,
-                 fut_steps=4,
+                 past_steps=4,               # 过去轨迹帧数
+                 fut_steps=4,                # 未来轨迹帧数
                  **kwargs):
 
         self.bev_h = bev_h
@@ -53,7 +69,6 @@ class BEVFormerTrackHead(DETRHead):
         self.fp16_enabled = False
 
         self.with_box_refine = with_box_refine
-
         assert as_two_stage is False, 'as_two_stage is not supported yet.'
         self.as_two_stage = as_two_stage
         if self.as_two_stage:
@@ -81,7 +96,15 @@ class BEVFormerTrackHead(DETRHead):
             self.code_weights, requires_grad=False), requires_grad=False)
 
     def _init_layers(self):
-        """Initialize classification branch and regression branch of head."""
+        """初始化分类、回归和轨迹预测分支
+
+        三个分支:
+        1. cls_branch: 分类分支 (FC+LN+ReLU → FC)
+        2. reg_branch: 框回归分支 (FC+ReLU → FC)
+        3. past_traj_reg_branch: 轨迹回归分支 (FC+ReLU → FC)
+           输出 (past_steps+fut_steps)*2 维，即每个时间步的 (x, y)
+        """
+        # 分类分支
         cls_branch = []
         for _ in range(self.num_reg_fcs):
             cls_branch.append(Linear(self.embed_dims, self.embed_dims))
@@ -90,6 +113,7 @@ class BEVFormerTrackHead(DETRHead):
         cls_branch.append(Linear(self.embed_dims, self.cls_out_channels))
         fc_cls = nn.Sequential(*cls_branch)
 
+        # 框回归分支
         reg_branch = []
         for _ in range(self.num_reg_fcs):
             reg_branch.append(Linear(self.embed_dims, self.embed_dims))
@@ -97,10 +121,10 @@ class BEVFormerTrackHead(DETRHead):
         reg_branch.append(Linear(self.embed_dims, self.code_size))
         reg_branch = nn.Sequential(*reg_branch)
 
+        # 轨迹回归分支: 输出 (past_steps+fut_steps)*2 维
         past_traj_reg_branch = []
         for _ in range(self.num_reg_fcs):
-            past_traj_reg_branch.append(
-                Linear(self.embed_dims, self.embed_dims))
+            past_traj_reg_branch.append(Linear(self.embed_dims, self.embed_dims))
             past_traj_reg_branch.append(nn.ReLU())
         past_traj_reg_branch.append(
             Linear(self.embed_dims, (self.past_steps + self.fut_steps)*2))
@@ -109,36 +133,47 @@ class BEVFormerTrackHead(DETRHead):
         def _get_clones(module, N):
             return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
-        # last reg_branch is used to generate proposal from
-        # encode feature map when as_two_stage is True.
         num_pred = (self.transformer.decoder.num_layers + 1) if \
             self.as_two_stage else self.transformer.decoder.num_layers
 
         if self.with_box_refine:
             self.cls_branches = _get_clones(fc_cls, num_pred)
             self.reg_branches = _get_clones(reg_branch, num_pred)
-            self.past_traj_reg_branches = _get_clones(
-                past_traj_reg_branch, num_pred)
+            self.past_traj_reg_branches = _get_clones(past_traj_reg_branch, num_pred)
         else:
-            self.cls_branches = nn.ModuleList(
-                [fc_cls for _ in range(num_pred)])
-            self.reg_branches = nn.ModuleList(
-                [reg_branch for _ in range(num_pred)])
-            self.past_traj_reg_branches = nn.ModuleList(
-                [past_traj_reg_branch for _ in range(num_pred)])
+            self.cls_branches = nn.ModuleList([fc_cls for _ in range(num_pred)])
+            self.reg_branches = nn.ModuleList([reg_branch for _ in range(num_pred)])
+            self.past_traj_reg_branches = nn.ModuleList([past_traj_reg_branch for _ in range(num_pred)])
+
         if not self.as_two_stage:
+            # 只有 BEV embedding，不创建 query_embedding
+            # query_embedding 由外部 track_instances 提供
             self.bev_embedding = nn.Embedding(
                 self.bev_h * self.bev_w, self.embed_dims)
 
     def init_weights(self):
-        """Initialize weights of the DeformDETR head."""
+        """初始化权重"""
         self.transformer.init_weights()
         if self.loss_cls.use_sigmoid:
             bias_init = bias_init_with_prob(0.01)
             for m in self.cls_branches:
                 nn.init.constant_(m[-1].bias, bias_init)
-    
+
     def get_bev_features(self, mlvl_feats, img_metas, prev_bev=None):
+        """生成 BEV 特征
+
+        只调用 Transformer 的 Encoder 部分，不执行 Decoder。
+        返回 BEV 特征和位置编码。
+
+        Args:
+            mlvl_feats: 多尺度图像特征
+            img_metas: 图像元信息
+            prev_bev: 上一帧 BEV 特征
+
+        Returns:
+            bev_embed: BEV 特征 (bev_h*bev_w, B, C)
+            bev_pos: BEV 位置编码 (B, C, bev_h, bev_w)
+        """
         bs, num_cam, _, _, _ = mlvl_feats[0].shape
         dtype = mlvl_feats[0].dtype
         bev_queries = self.bev_embedding.weight.to(dtype)
@@ -147,84 +182,89 @@ class BEVFormerTrackHead(DETRHead):
                                device=bev_queries.device).to(dtype)
         bev_pos = self.positional_encoding(bev_mask).to(dtype)
         bev_embed = self.transformer.get_bev_features(
-            mlvl_feats,
-            bev_queries,
-            self.bev_h,
-            self.bev_w,
-            self.real_h,
-            self.real_w,
-            grid_length=(self.real_h / self.bev_h,
-                         self.real_w / self.bev_w),
-            bev_pos=bev_pos,
-            prev_bev=prev_bev,
-            img_metas=img_metas,
-        )
+            mlvl_feats, bev_queries, self.bev_h, self.bev_w,
+            self.real_h, self.real_w,
+            grid_length=(self.real_h / self.bev_h, self.real_w / self.bev_w),
+            bev_pos=bev_pos, prev_bev=prev_bev, img_metas=img_metas)
         return bev_embed, bev_pos
 
-    def get_detections(
-        self, 
-        bev_embed,
-        object_query_embeds=None,
-        ref_points=None,
-        img_metas=None,
-    ):
+    def get_detections(self, bev_embed, object_query_embeds=None, ref_points=None, img_metas=None):
+        """在 BEV 特征上进行目标检测
+
+        与 BEVFormerHead.forward() 的区别:
+        1. object_query_embeds 来自外部 (track_instances.query)
+        2. ref_points 来自外部 (track_instances.ref_pts)
+        3. 额外输出轨迹预测 (all_past_traj_preds)
+        4. 输出 query_feats 用于 Memory Bank 存储
+
+        Args:
+            bev_embed: BEV 特征 (bev_h*bev_w, B, C)
+            object_query_embeds: 目标查询向量 (num_query, 2*C)
+            ref_points: 参考点 (num_query, 3) 在 inverse sigmoid 空间
+            img_metas: 图像元信息
+
+        Returns:
+            outs: 字典，包含:
+                - all_cls_scores: 分类分数
+                - all_bbox_preds: 框预测
+                - all_past_traj_preds: 轨迹预测
+                - last_ref_points: 最后的参考点 (用于速度更新)
+                - query_feats: query 特征 (用于 Memory Bank)
+        """
         assert bev_embed.shape[0] == self.bev_h * self.bev_w
+
+        # Decoder 前向传播: object queries 在 BEV 特征上做交叉注意力
         hs, init_reference, inter_references = self.transformer.get_states_and_refs(
-            bev_embed,
-            object_query_embeds,
-            self.bev_h,
-            self.bev_w,
+            bev_embed, object_query_embeds, self.bev_h, self.bev_w,
             reference_points=ref_points,
             reg_branches=self.reg_branches if self.with_box_refine else None,
             cls_branches=self.cls_branches if self.as_two_stage else None,
-            img_metas=img_metas,
-        )
+            img_metas=img_metas)
+
         hs = hs.permute(0, 2, 1, 3)
         outputs_classes = []
         outputs_coords = []
         outputs_trajs = []
+
         for lvl in range(hs.shape[0]):
             if lvl == 0:
-                # reference = init_reference
-                reference = ref_points.sigmoid()
+                reference = ref_points.sigmoid()  # 第一层使用外部提供的参考点
             else:
                 reference = inter_references[lvl - 1]
-                # ref_size_base = inter_box_sizes[lvl - 1]
+
             reference = inverse_sigmoid(reference)
             outputs_class = self.cls_branches[lvl](hs[lvl])
-            tmp = self.reg_branches[lvl](hs[lvl])  # xydxdyxdz
+            tmp = self.reg_branches[lvl](hs[lvl])
+
+            # 轨迹预测: (bs, num_query, past_steps+fut_steps, 2)
             outputs_past_traj = self.past_traj_reg_branches[lvl](hs[lvl]).view(
                 tmp.shape[0], -1, self.past_steps + self.fut_steps, 2)
-            # TODO: check the shape of reference
+
             assert reference.shape[-1] == 3
+            # 解码框坐标
             tmp[..., 0:2] += reference[..., 0:2]
             tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
             tmp[..., 4:5] += reference[..., 2:3]
             tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
 
-            last_ref_points = torch.cat(
-                [tmp[..., 0:2], tmp[..., 4:5]], dim=-1,
-            )
+            # 保存参考点用于速度更新
+            last_ref_points = torch.cat([tmp[..., 0:2], tmp[..., 4:5]], dim=-1)
 
-            tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
-                             self.pc_range[0]) + self.pc_range[0])
-            tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
-                             self.pc_range[1]) + self.pc_range[1])
-            tmp[..., 4:5] = (tmp[..., 4:5] * (self.pc_range[5] -
-                             self.pc_range[2]) + self.pc_range[2])
+            # 反归一化到实际坐标
+            tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0])
+            tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1])
+            tmp[..., 4:5] = (tmp[..., 4:5] * (self.pc_range[5] - self.pc_range[2]) + self.pc_range[2])
 
-            # tmp[..., 2:4] = tmp[..., 2:4] + ref_size_basse[..., 0:2]
-            # tmp[..., 5:6] = tmp[..., 5:6] + ref_size_basse[..., 2:3]
-
-            # TODO: check if using sigmoid
             outputs_coord = tmp
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
             outputs_trajs.append(outputs_past_traj)
+
         outputs_classes = torch.stack(outputs_classes)
         outputs_coords = torch.stack(outputs_coords)
         outputs_trajs = torch.stack(outputs_trajs)
         last_ref_points = inverse_sigmoid(last_ref_points)
+
         outs = {
             'all_cls_scores': outputs_classes,
             'all_bbox_preds': outputs_coords,
@@ -235,107 +275,33 @@ class BEVFormerTrackHead(DETRHead):
             'query_feats': hs,
         }
         return outs
-        
-    def _get_target_single(self,
-                           cls_score,
-                           bbox_pred,
-                           gt_labels,
-                           gt_bboxes,
-                           gt_bboxes_ignore=None):
-        """"Compute regression and classification targets for one image.
-        Outputs from a single decoder layer of a single feature level are used.
-        Args:
-            cls_score (Tensor): Box score logits from a single decoder layer
-                for one image. Shape [num_query, cls_out_channels].
-            bbox_pred (Tensor): Sigmoid outputs from a single decoder layer
-                for one image, with normalized coordinate (cx, cy, w, h) and
-                shape [num_query, 4].
-            gt_bboxes (Tensor): Ground truth bboxes for one image with
-                shape (num_gts, 4) in [tl_x, tl_y, br_x, br_y] format.
-            gt_labels (Tensor): Ground truth class indices for one image
-                with shape (num_gts, ).
-            gt_bboxes_ignore (Tensor, optional): Bounding boxes
-                which can be ignored. Default None.
-        Returns:
-            tuple[Tensor]: a tuple containing the following for one image.
-                - labels (Tensor): Labels of each image.
-                - label_weights (Tensor]): Label weights of each image.
-                - bbox_targets (Tensor): BBox targets of each image.
-                - bbox_weights (Tensor): BBox weights of each image.
-                - pos_inds (Tensor): Sampled positive indices for each image.
-                - neg_inds (Tensor): Sampled negative indices for each image.
-        """
 
+    def _get_target_single(self, cls_score, bbox_pred, gt_labels, gt_bboxes, gt_bboxes_ignore=None):
+        """为单张图像计算目标 (与 BEVFormerHead 相同)"""
         num_bboxes = bbox_pred.size(0)
-        # assigner and sampler
         gt_c = gt_bboxes.shape[-1]
 
-        assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes,
-                                             gt_labels, gt_bboxes_ignore)
-
-        sampling_result = self.sampler.sample(assign_result, bbox_pred,
-                                              gt_bboxes)
+        assign_result = self.assigner.assign(bbox_pred, cls_score, gt_bboxes, gt_labels, gt_bboxes_ignore)
+        sampling_result = self.sampler.sample(assign_result, bbox_pred, gt_bboxes)
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
 
-        # label targets
-        labels = gt_bboxes.new_full((num_bboxes,),
-                                    self.num_classes,
-                                    dtype=torch.long)
+        labels = gt_bboxes.new_full((num_bboxes,), self.num_classes, dtype=torch.long)
         labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
         label_weights = gt_bboxes.new_ones(num_bboxes)
 
-        # bbox targets
         bbox_targets = torch.zeros_like(bbox_pred)[..., :gt_c]
         bbox_weights = torch.zeros_like(bbox_pred)
         bbox_weights[pos_inds] = 1.0
-
-        # DETR
         bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
-        return (labels, label_weights, bbox_targets, bbox_weights,
-                pos_inds, neg_inds)
 
-    def get_targets(self,
-                    cls_scores_list,
-                    bbox_preds_list,
-                    gt_bboxes_list,
-                    gt_labels_list,
-                    gt_bboxes_ignore_list=None):
-        """"Compute regression and classification targets for a batch image.
-        Outputs from a single decoder layer of a single feature level are used.
-        Args:
-            cls_scores_list (list[Tensor]): Box score logits from a single
-                decoder layer for each image with shape [num_query,
-                cls_out_channels].
-            bbox_preds_list (list[Tensor]): Sigmoid outputs from a single
-                decoder layer for each image, with normalized coordinate
-                (cx, cy, w, h) and shape [num_query, 4].
-            gt_bboxes_list (list[Tensor]): Ground truth bboxes for each image
-                with shape (num_gts, 4) in [tl_x, tl_y, br_x, br_y] format.
-            gt_labels_list (list[Tensor]): Ground truth class indices for each
-                image with shape (num_gts, ).
-            gt_bboxes_ignore_list (list[Tensor], optional): Bounding
-                boxes which can be ignored for each image. Default None.
-        Returns:
-            tuple: a tuple containing the following targets.
-                - labels_list (list[Tensor]): Labels for all images.
-                - label_weights_list (list[Tensor]): Label weights for all \
-                    images.
-                - bbox_targets_list (list[Tensor]): BBox targets for all \
-                    images.
-                - bbox_weights_list (list[Tensor]): BBox weights for all \
-                    images.
-                - num_total_pos (int): Number of positive samples in all \
-                    images.
-                - num_total_neg (int): Number of negative samples in all \
-                    images.
-        """
-        assert gt_bboxes_ignore_list is None, \
-            'Only supports for gt_bboxes_ignore setting to None.'
+        return (labels, label_weights, bbox_targets, bbox_weights, pos_inds, neg_inds)
+
+    def get_targets(self, cls_scores_list, bbox_preds_list, gt_bboxes_list, gt_labels_list, gt_bboxes_ignore_list=None):
+        """为 batch 计算目标"""
+        assert gt_bboxes_ignore_list is None, 'Only supports for gt_bboxes_ignore setting to None.'
         num_imgs = len(cls_scores_list)
-        gt_bboxes_ignore_list = [
-            gt_bboxes_ignore_list for _ in range(num_imgs)
-        ]
+        gt_bboxes_ignore_list = [gt_bboxes_ignore_list for _ in range(num_imgs)]
 
         (labels_list, label_weights_list, bbox_targets_list,
          bbox_weights_list, pos_inds_list, neg_inds_list) = multi_apply(
@@ -346,36 +312,13 @@ class BEVFormerTrackHead(DETRHead):
         return (labels_list, label_weights_list, bbox_targets_list,
                 bbox_weights_list, num_total_pos, num_total_neg)
 
-    def loss_single(self,
-                    cls_scores,
-                    bbox_preds,
-                    gt_bboxes_list,
-                    gt_labels_list,
-                    gt_bboxes_ignore_list=None):
-        """"Loss function for outputs from a single decoder layer of a single
-        feature level.
-        Args:
-            cls_scores (Tensor): Box score logits from a single decoder layer
-                for all images. Shape [bs, num_query, cls_out_channels].
-            bbox_preds (Tensor): Sigmoid outputs from a single decoder layer
-                for all images, with normalized coordinate (cx, cy, w, h) and
-                shape [bs, num_query, 4].
-            gt_bboxes_list (list[Tensor]): Ground truth bboxes for each image
-                with shape (num_gts, 4) in [tl_x, tl_y, br_x, br_y] format.
-            gt_labels_list (list[Tensor]): Ground truth class indices for each
-                image with shape (num_gts, ).
-            gt_bboxes_ignore_list (list[Tensor], optional): Bounding
-                boxes which can be ignored for each image. Default None.
-        Returns:
-            dict[str, Tensor]: A dictionary of loss components for outputs from
-                a single decoder layer.
-        """
+    def loss_single(self, cls_scores, bbox_preds, gt_bboxes_list, gt_labels_list, gt_bboxes_ignore_list=None):
+        """单层 Decoder 的检测损失"""
         num_imgs = cls_scores.size(0)
         cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
         cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
-                                           gt_bboxes_list, gt_labels_list,
-                                           gt_bboxes_ignore_list)
+                                           gt_bboxes_list, gt_labels_list, gt_bboxes_ignore_list)
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
         labels = torch.cat(labels_list, 0)
@@ -383,75 +326,32 @@ class BEVFormerTrackHead(DETRHead):
         bbox_targets = torch.cat(bbox_targets_list, 0)
         bbox_weights = torch.cat(bbox_weights_list, 0)
 
-        # classification loss
+        # 分类损失
         cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
-        # construct weighted avg_factor to match with the official DETR repo
-        cls_avg_factor = num_total_pos * 1.0 + \
-            num_total_neg * self.bg_cls_weight
+        cls_avg_factor = num_total_pos * 1.0 + num_total_neg * self.bg_cls_weight
         if self.sync_cls_avg_factor:
-            cls_avg_factor = reduce_mean(
-                cls_scores.new_tensor([cls_avg_factor]))
-
+            cls_avg_factor = reduce_mean(cls_scores.new_tensor([cls_avg_factor]))
         cls_avg_factor = max(cls_avg_factor, 1)
-        loss_cls = self.loss_cls(
-            cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
+        loss_cls = self.loss_cls(cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
 
-        # Compute the average number of gt boxes accross all gpus, for
-        # normalization purposes
+        # 框回归损失
         num_total_pos = loss_cls.new_tensor([num_total_pos])
         num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
-
-        # regression L1 loss
         bbox_preds = bbox_preds.reshape(-1, bbox_preds.size(-1))
         normalized_bbox_targets = normalize_bbox(bbox_targets, self.pc_range)
         isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
         bbox_weights = bbox_weights * self.code_weights
-
         loss_bbox = self.loss_bbox(
-            bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan,
-                                                               :10], bbox_weights[isnotnan, :10],
-            avg_factor=num_total_pos)
+            bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10],
+            bbox_weights[isnotnan, :10], avg_factor=num_total_pos)
         loss_cls = torch.nan_to_num(loss_cls)
         loss_bbox = torch.nan_to_num(loss_bbox)
         return loss_cls, loss_bbox
 
     @force_fp32(apply_to=('preds_dicts'))
-    def loss(self,
-             gt_bboxes_list,
-             gt_labels_list,
-             preds_dicts,
-             gt_bboxes_ignore=None,
-             img_metas=None):
-        """"Loss function.
-        Args:
-
-            gt_bboxes_list (list[Tensor]): Ground truth bboxes for each image
-                with shape (num_gts, 4) in [tl_x, tl_y, br_x, br_y] format.
-            gt_labels_list (list[Tensor]): Ground truth class indices for each
-                image with shape (num_gts, ).
-            preds_dicts:
-                all_cls_scores (Tensor): Classification score of all
-                    decoder layers, has shape
-                    [nb_dec, bs, num_query, cls_out_channels].
-                all_bbox_preds (Tensor): Sigmoid regression
-                    outputs of all decode layers. Each is a 4D-tensor with
-                    normalized coordinate format (cx, cy, w, h) and shape
-                    [nb_dec, bs, num_query, 4].
-                enc_cls_scores (Tensor): Classification scores of
-                    points on encode feature map , has shape
-                    (N, h*w, num_classes). Only be passed when as_two_stage is
-                    True, otherwise is None.
-                enc_bbox_preds (Tensor): Regression results of each points
-                    on the encode feature map, has shape (N, h*w, 4). Only be
-                    passed when as_two_stage is True, otherwise is None.
-            gt_bboxes_ignore (list[Tensor], optional): Bounding boxes
-                which can be ignored for each image. Default None.
-        Returns:
-            dict[str, Tensor]: A dictionary of loss components.
-        """
-        assert gt_bboxes_ignore is None, \
-            f'{self.__class__.__name__} only supports ' \
-            f'for gt_bboxes_ignore setting to None.'
+    def loss(self, gt_bboxes_list, gt_labels_list, preds_dicts, gt_bboxes_ignore=None, img_metas=None):
+        """检测损失计算 (与 BEVFormerHead 相同)"""
+        assert gt_bboxes_ignore is None, f'{self.__class__.__name__} only supports for gt_bboxes_ignore setting to None.'
 
         all_cls_scores = preds_dicts['all_cls_scores']
         all_bbox_preds = preds_dicts['all_bbox_preds']
@@ -462,41 +362,31 @@ class BEVFormerTrackHead(DETRHead):
         device = gt_labels_list[0].device
 
         gt_bboxes_list = [torch.cat(
-            (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
-            dim=1).to(device) for gt_bboxes in gt_bboxes_list]
+            (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]), dim=1).to(device)
+            for gt_bboxes in gt_bboxes_list]
 
         all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)]
         all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
-        all_gt_bboxes_ignore_list = [
-            gt_bboxes_ignore for _ in range(num_dec_layers)
-        ]
+        all_gt_bboxes_ignore_list = [gt_bboxes_ignore for _ in range(num_dec_layers)]
 
         losses_cls, losses_bbox = multi_apply(
             self.loss_single, all_cls_scores, all_bbox_preds,
-            all_gt_bboxes_list, all_gt_labels_list,
-            all_gt_bboxes_ignore_list)
+            all_gt_bboxes_list, all_gt_labels_list, all_gt_bboxes_ignore_list)
 
         loss_dict = dict()
-        # loss of proposal generated from encode feature map.
         if enc_cls_scores is not None:
             binary_labels_list = [
-                torch.zeros_like(gt_labels_list[i])
-                for i in range(len(all_gt_labels_list))
-            ]
-            enc_loss_cls, enc_losses_bbox = \
-                self.loss_single(enc_cls_scores, enc_bbox_preds,
-                                 gt_bboxes_list, binary_labels_list, gt_bboxes_ignore)
+                torch.zeros_like(gt_labels_list[i]) for i in range(len(all_gt_labels_list))]
+            enc_loss_cls, enc_losses_bbox = self.loss_single(
+                enc_cls_scores, enc_bbox_preds, gt_bboxes_list, binary_labels_list, gt_bboxes_ignore)
             loss_dict['enc_loss_cls'] = enc_loss_cls
             loss_dict['enc_loss_bbox'] = enc_losses_bbox
 
-        # loss from the last decoder layer
         loss_dict['loss_cls'] = losses_cls[-1]
         loss_dict['loss_bbox'] = losses_bbox[-1]
 
-        # loss from other decoder layers
         num_dec_layer = 0
-        for loss_cls_i, loss_bbox_i in zip(losses_cls[:-1],
-                                           losses_bbox[:-1]):
+        for loss_cls_i, loss_bbox_i in zip(losses_cls[:-1], losses_bbox[:-1]):
             loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
             loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
             num_dec_layer += 1
@@ -504,14 +394,7 @@ class BEVFormerTrackHead(DETRHead):
 
     @force_fp32(apply_to=('preds_dicts'))
     def get_bboxes(self, preds_dicts, img_metas, rescale=False):
-        """Generate bboxes from bbox head predictions.
-        Args:
-            preds_dicts (tuple[list[dict]]): Prediction results.
-            img_metas (list[dict]): Point cloud and image's meta info.
-        Returns:
-            list[dict]: Decoded bbox, scores and labels after nms.
-        """
-
+        """从预测结果解码检测框"""
         preds_dicts = self.bbox_coder.decode(preds_dicts)
 
         num_samples = len(preds_dicts)
@@ -519,16 +402,13 @@ class BEVFormerTrackHead(DETRHead):
         for i in range(num_samples):
             preds = preds_dicts[i]
             bboxes = preds['bboxes']
-
             bboxes[:, 2] = bboxes[:, 2] - bboxes[:, 5] * 0.5
-
             code_size = bboxes.shape[-1]
             bboxes = img_metas[i]['box_type_3d'](bboxes, code_size)
             scores = preds['scores']
             labels = preds['labels']
             bbox_index = preds['bbox_index']
             mask = preds['mask']
-
             ret_list.append([bboxes, scores, labels, bbox_index, mask])
 
         return ret_list
