@@ -79,12 +79,6 @@ class UniAD(UniADTrack):
         assert set(task_loss_weight.keys()) == \
                {'track', 'occ', 'motion', 'map', 'planning'}
 
-        # 类型注解：声明各 Head 类型为 SegDETRHead
-        self.seg_head: SegDETRHead = build_head(seg_head)
-        self.occ_head: SegDETRHead = build_head(occ_head)
-        self.motion_head: SegDETRHead = build_head(motion_head)
-        self.planning_head: SegDETRHead = build_head(planning_head)
-
     @property
     def with_planning_head(self):
         """是否启用规划头"""
